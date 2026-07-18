@@ -1,0 +1,113 @@
+#!/bin/bash
+# GCP startup script for a resumable spot-VM batch job.
+# Runs as root on EVERY boot, including the boot after a spot preemption --
+# that's what makes preemption recovery automatic. Fill in the CONFIG block,
+# then attach this whole file as the instance's --metadata-from-file
+# startup-script=... (a separate metadata key from the job code itself).
+
+set -u
+
+# ---- CONFIG: fill these in for the real job -------------------------------
+JOBDIR=/opt/JOB_NAME              # TODO: rename JOB_NAME everywhere in this file
+OUT="$JOBDIR/output"
+CODE_METADATA_KEY="job-code"      # metadata key holding the worker .py contents
+WORKER_FILE="worker.py"           # local filename the worker code is written to
+PY_DEPS="xarray s3fs h5netcdf netCDF4 cftime dask"   # TODO: real deps for this job
+RUN_ARGS="--start 2000 --end 2080 --workers 8 --outdir $OUT"  # TODO: real CLI args
+# If the job needs a credential (API key, token), uncomment and set the
+# metadata key + destination -- this is a SECRET, don't let it end up in a repo.
+# SECRET_METADATA_KEY="job-api-key"
+# SECRET_DEST="$HOME/.job-credentials"
+# -----------------------------------------------------------------------------
+
+mkdir -p "$JOBDIR" "$OUT"
+exec >>"$JOBDIR/startup.log" 2>&1
+echo "===== startup $(date -u) ====="
+
+# --- one-time environment setup (idempotent across restarts) ---------------
+if [ ! -f "$JOBDIR/.setup_done" ]; then
+  echo "installing python + deps..."
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update -y
+  apt-get install -y python3-pip python3-venv
+  python3 -m venv "$JOBDIR/venv"
+  "$JOBDIR/venv/bin/pip" install --upgrade pip
+  "$JOBDIR/venv/bin/pip" install $PY_DEPS
+  touch "$JOBDIR/.setup_done"
+fi
+
+# --- fetch the worker code fresh from instance metadata on every boot ------
+# This is what lets you push updated code with a single `gcloud compute
+# instances add-metadata --metadata-from-file` call, with no image rebuild --
+# it takes effect on the very next boot (including a preemption restart).
+curl -s -H "Metadata-Flavor: Google" \
+  "http://metadata.google.internal/computeMetadata/v1/instance/attributes/$CODE_METADATA_KEY" \
+  -o "$JOBDIR/$WORKER_FILE"
+
+# --- optional: write a credential from metadata -----------------------------
+# if [ -n "${SECRET_METADATA_KEY:-}" ]; then
+#   curl -s -H "Metadata-Flavor: Google" \
+#     "http://metadata.google.internal/computeMetadata/v1/instance/attributes/$SECRET_METADATA_KEY" \
+#     -o "$SECRET_DEST"
+#   chmod 600 "$SECRET_DEST"
+# fi
+
+# --- write the run wrapper --------------------------------------------------
+cat >"$JOBDIR/run.sh" <<RUNEOF
+#!/bin/bash
+cd "$JOBDIR"
+# clear any temp scratch left over from an interrupted (preempted) run
+rm -rf /tmp/${WORKER_FILE%.py}_* 2>/dev/null || true
+echo "===== job start \$(date -u) ====="
+"$JOBDIR/venv/bin/python" "$JOBDIR/$WORKER_FILE" $RUN_ARGS
+rc=\$?
+echo "===== job exit code \$rc at \$(date -u) ====="
+if [ \$rc -eq 0 ]; then touch "$JOBDIR/.complete"; fi
+RUNEOF
+chmod +x "$JOBDIR/run.sh"
+
+# --- (re-)arm the self-stop watcher, unconditionally, on every boot --------
+# This must happen BEFORE the worker early-exit checks below, and every single
+# boot, not just the first -- a transient systemd unit does NOT survive a
+# reboot, and a preemption *is* a reboot. Writing the watcher to $JOBDIR (the
+# persistent disk) rather than /tmp, and re-launching it here, is what makes
+# it boot-persistent the same way the worker already is. Skipping this step
+# was tested and confirmed to silently leave a finished job's VM running
+# indefinitely after a preemption -- see references/troubleshooting.md.
+cat >"$JOBDIR/selfstop.sh" <<'SELFSTOPEOF'
+#!/bin/bash
+set -u
+JOBDIR="__JOBDIR__"
+exec >>"$JOBDIR/selfstop.log" 2>&1
+echo "=== selfstop watcher armed $(date -u) ==="
+while [ ! -f "$JOBDIR/.complete" ]; do
+  sleep 120
+done
+echo "$(date -u) .complete detected; stopping VM now."
+sync
+sleep 5
+/sbin/shutdown -h now
+SELFSTOPEOF
+sed -i "s|__JOBDIR__|$JOBDIR|" "$JOBDIR/selfstop.sh"
+chmod +x "$JOBDIR/selfstop.sh"
+SELFSTOP_UNIT="$(basename "$JOBDIR")-selfstop"
+if ! systemctl is-active --quiet "$SELFSTOP_UNIT" 2>/dev/null; then
+  systemctl reset-failed "$SELFSTOP_UNIT" 2>/dev/null || true
+  systemd-run --unit="$SELFSTOP_UNIT" --collect bash "$JOBDIR/selfstop.sh"
+  echo "self-stop watcher ($SELFSTOP_UNIT) (re-)armed."
+else
+  echo "self-stop watcher ($SELFSTOP_UNIT) already active; leaving it alone."
+fi
+
+# --- launch the worker (skip if already finished or already running) -------
+if [ -f "$JOBDIR/.complete" ]; then
+  echo "job already complete; nothing to do (watcher above will stop the VM)."
+  exit 0
+fi
+if pgrep -f "$WORKER_FILE" >/dev/null; then
+  echo "job already running; leaving it alone."
+  exit 0
+fi
+echo "launching job in background..."
+setsid bash "$JOBDIR/run.sh" >>"$JOBDIR/run.log" 2>&1 </dev/null &
+echo "launched."
