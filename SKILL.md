@@ -117,7 +117,36 @@ end up committed to a repo.
 
 Don't rely on a human noticing completion — a spot VM idling overnight after the
 job finished is pure waste. Deploy a tiny watcher that polls for the worker's
-`.complete` marker and shuts the machine down the moment it appears.
+completion marker and shuts the machine down the moment it appears.
+
+**Use two markers, not one.** This is the detail that decides whether the cost
+guard actually holds:
+
+- `.complete` — the run succeeded *fully*. Strict, and worth keeping strict
+  (a partial run must never look done).
+- `.finished` — the run reached a **terminal** state, success or not.
+
+Watch for **either**, plus an absolute wall-clock backstop. If the watcher keys
+only off `.complete`, then a run that *fails* writes no marker at all, the
+watcher waits forever, and the VM bills indefinitely — precisely the failure this
+step exists to prevent. The strictness of `.complete` is what creates the hazard,
+so `.finished` is what defuses it without loosening `.complete`.
+
+**Ordering constraint, silently fatal if reversed:** the startup script must
+delete a stale `.finished` **before** arming the watcher, because the watcher
+tests its markers *before* its first sleep and will otherwise stop the VM seconds
+into a fresh retry. Never clear `.complete` on boot — a genuinely finished job
+should stop again rather than redo its work.
+
+**Retrieval deadlock — the flip side of doing this right.** Because the watcher
+tests before sleeping, every boot of an already-`.complete` VM shuts it down
+within seconds. That is correct, and it makes the machine impossible to SSH into
+to collect results: Step 5 says to download "once the VM is running and
+`.complete` is present," which is a state you otherwise can't hold. The template
+therefore honours a `retrieval-hold=1` instance-metadata key that suppresses the
+watcher and worker for one boot. It is a deliberate opt-out of the cost guard —
+a VM booted with it set runs until stopped by hand — so clear it as soon as the
+download is verified.
 
 **The watcher must be (re-)armed by the startup script itself, on every boot** —
 not launched once by hand over SSH. This isn't a style preference: a preemption
@@ -172,12 +201,33 @@ context. Each one is separately gated:
    monitoring loop doing this is reasonable and was used successfully this way.
 
 2. **Downloading the results.** Only once the VM is confirmed running and
-   `.complete` is present. Use [scripts/retrieve_and_verify.sh](scripts/retrieve_and_verify.sh):
+   `.complete` is present.
+
+   To reach that state at all you must set the retrieval hold *before* starting
+   the VM — otherwise the watcher stops it within seconds of boot and your SSH
+   attempts just time out on a machine that is already shutting down:
+
+   ```bash
+   gcloud compute instances add-metadata JOB_NAME --zone=ZONE \
+     --metadata retrieval-hold=1
+   gcloud compute instances start JOB_NAME --zone=ZONE
+   ```
+
+   Then use [scripts/retrieve_and_verify.sh](scripts/retrieve_and_verify.sh):
    it SSHes in, tars every output file together with a `sha256sum` manifest,
    `scp`s the single tarball down (far more reliable than `scp --recurse` over
    many small files), extracts locally, and verifies every file's checksum
    against the manifest before calling anything successful. A raw file count is
    not verification — a truncated transfer can still produce the right count.
+   **Check its file glob** (`*.nc *.csv` by default) actually covers this job's
+   outputs — a run manifest or JSON sidecar is easy to leave behind, and losing
+   it costs you the record of which gaps were expected.
+
+   Checksums prove transport, not correctness. Follow with a content sanity
+   check before trusting the data.
+
+   Clear the hold (`--metadata retrieval-hold=0`) once verified, unless the VM
+   is about to be deleted anyway.
 
 3. **Deleting the VM.** Only when the user explicitly asks, and only after a
    **verified** download. If verification fails for any reason — a checksum

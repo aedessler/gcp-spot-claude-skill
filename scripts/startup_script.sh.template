@@ -14,6 +14,10 @@ CODE_METADATA_KEY="job-code"      # metadata key holding the worker .py contents
 WORKER_FILE="worker.py"           # local filename the worker code is written to
 PY_DEPS="xarray s3fs h5netcdf netCDF4 cftime dask"   # TODO: real deps for this job
 RUN_ARGS="--start 2000 --end 2080 --workers 8 --outdir $OUT"  # TODO: real CLI args
+# Absolute backstop: stop the VM after this many seconds no matter what, so a
+# hung or crashed worker that never writes a marker can't bill indefinitely.
+# TODO: set comfortably above the expected runtime.
+MAX_RUNTIME_S=50400
 # If the job needs a credential (API key, token), uncomment and set the
 # metadata key + destination -- this is a SECRET, don't let it end up in a repo.
 # SECRET_METADATA_KEY="job-api-key"
@@ -63,8 +67,45 @@ echo "===== job start \$(date -u) ====="
 rc=\$?
 echo "===== job exit code \$rc at \$(date -u) ====="
 if [ \$rc -eq 0 ]; then touch "$JOBDIR/.complete"; fi
+# .finished marks a TERMINAL state regardless of outcome. Without it, a failed
+# run writes no marker at all, the watcher waits forever, and the VM bills
+# indefinitely -- the exact failure this whole pattern exists to prevent.
+touch "$JOBDIR/.finished"
 RUNEOF
 chmod +x "$JOBDIR/run.sh"
+
+# --- retrieval hold: let a FINISHED VM stay up long enough to download from -
+# Once .complete exists, the watcher below stops the VM within seconds of every
+# boot. That is right for cost control and wrong for retrieval: restarting a
+# completed VM to collect its results gets you a machine that shuts down before
+# sshd is reliably up, so the download can never happen. Setting the instance
+# metadata key `retrieval-hold=1` suppresses the watcher and the worker for that
+# boot:
+#
+#   gcloud compute instances add-metadata JOB_NAME --zone=ZONE \
+#     --metadata retrieval-hold=1
+#
+# This is a deliberate opt-out of the cost guard: a VM booted with the hold set
+# runs until stopped or deleted by hand. Clear it (retrieval-hold=0) as soon as
+# the download is verified, unless the VM is about to be deleted anyway.
+HOLD=$(curl -s -H "Metadata-Flavor: Google" \
+  "http://metadata.google.internal/computeMetadata/v1/instance/attributes/retrieval-hold" \
+  2>/dev/null)
+if [ "${HOLD:-0}" = "1" ]; then
+  echo "retrieval-hold=1 -- watcher and worker suppressed for this boot."
+  echo "VM will stay up until stopped or deleted manually."
+  exit 0
+fi
+
+# --- clear a stale terminal marker BEFORE arming the watcher ---------------
+# Ordering matters and is silently fatal to get wrong. The watcher checks for
+# .finished immediately on start, so arming it while a stale marker from a
+# previous failed run is still on disk shuts the VM down seconds into this
+# boot's retry. .complete is deliberately NOT cleared -- a genuinely finished
+# job should stop again rather than redo work it already did.
+if [ ! -f "$JOBDIR/.complete" ]; then
+  rm -f "$JOBDIR/.finished"
+fi
 
 # --- (re-)arm the self-stop watcher, unconditionally, on every boot --------
 # This must happen BEFORE the worker early-exit checks below, and every single
@@ -78,17 +119,32 @@ cat >"$JOBDIR/selfstop.sh" <<'SELFSTOPEOF'
 #!/bin/bash
 set -u
 JOBDIR="__JOBDIR__"
+MAX_RUNTIME_S=__MAX_RUNTIME_S__
 exec >>"$JOBDIR/selfstop.log" 2>&1
-echo "=== selfstop watcher armed $(date -u) ==="
-while [ ! -f "$JOBDIR/.complete" ]; do
+echo "=== selfstop watcher armed $(date -u) (max ${MAX_RUNTIME_S}s) ==="
+elapsed=0
+while true; do
+  if [ -f "$JOBDIR/.complete" ]; then
+    echo "$(date -u) .complete detected; stopping VM now."
+    break
+  fi
+  if [ -f "$JOBDIR/.finished" ]; then
+    echo "$(date -u) .finished detected (terminal, not fully successful);"
+    echo "stopping VM to avoid idle billing. Inspect run.log before restarting."
+    break
+  fi
+  if [ "$elapsed" -ge "$MAX_RUNTIME_S" ]; then
+    echo "$(date -u) max runtime ${MAX_RUNTIME_S}s reached; stopping VM now."
+    break
+  fi
   sleep 120
+  elapsed=$((elapsed + 120))
 done
-echo "$(date -u) .complete detected; stopping VM now."
 sync
 sleep 5
 /sbin/shutdown -h now
 SELFSTOPEOF
-sed -i "s|__JOBDIR__|$JOBDIR|" "$JOBDIR/selfstop.sh"
+sed -i "s|__JOBDIR__|$JOBDIR|; s|__MAX_RUNTIME_S__|$MAX_RUNTIME_S|" "$JOBDIR/selfstop.sh"
 chmod +x "$JOBDIR/selfstop.sh"
 SELFSTOP_UNIT="$(basename "$JOBDIR")-selfstop"
 if ! systemctl is-active --quiet "$SELFSTOP_UNIT" 2>/dev/null; then

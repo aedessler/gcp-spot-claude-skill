@@ -189,11 +189,17 @@ def main(argv=None):
         log.info(r)
     log.info("done in %.1fs", time.time() - t0)
 
-    # Signal completion for the self-stop watcher (Step 4 of the skill) --
-    # only write this if nothing failed, so a partial run never looks done.
-    if not args.dry_run and not any("FAILED" in r for r in results):
-        open(os.path.join(args.outdir, "..", ".complete"), "w").close()
-    return 0
+    # Signal completion for the self-stop watcher (Step 4 of the skill).
+    #   .complete  strict: nothing failed, so a partial run never looks done.
+    #   .finished  terminal: written either way, so the watcher can still stop
+    #              the VM after a FAILED run instead of letting it bill forever.
+    failed = any("FAILED" in r for r in results)
+    if not args.dry_run:
+        jobroot = os.path.join(args.outdir, "..")
+        if not failed:
+            open(os.path.join(jobroot, ".complete"), "w").close()
+        open(os.path.join(jobroot, ".finished"), "w").close()
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":
